@@ -574,6 +574,8 @@ async def submit_interview_response(
     """Submit a video response for an interview question"""
     temp_video_file_path = None
     temp_audio_file_path = None
+    temp_modified_audio_path = None
+    modified_audio_path = None
 
     try:
         # Validate interview link
@@ -638,6 +640,24 @@ async def submit_interview_response(
                 audio_blob.make_public()
                 audio_extract_url = audio_blob.public_url
 
+                # Apply helium voice effect to the extracted audio
+                temp_modified_file = tempfile.NamedTemporaryFile(delete=False, suffix="_modified.wav")
+                temp_modified_audio_path = temp_modified_file.name
+                temp_modified_file.close()
+                
+                modified_audio_path = apply_voice_effect(
+                    temp_audio_file_path, 
+                    effect_type="helium", 
+                    output_audio_path=temp_modified_audio_path
+                )
+                
+                # Upload modified audio to Firebase Storage
+                modified_audio_storage_path = f"interview_responses/{application_id}/{request.interviewId}/{response_id}_modified_audio.wav"
+                modified_audio_blob = storage_bucket.blob(modified_audio_storage_path)
+                modified_audio_blob.upload_from_filename(modified_audio_path, content_type="audio/wav")
+                modified_audio_blob.make_public()
+                modified_audio_url = modified_audio_blob.public_url
+
                 # Transcribe audio using Google Cloud Speech-to-Text
                 transcription_result = transcribe_audio_with_google_cloud(temp_audio_file_path)
         
@@ -664,9 +684,6 @@ async def submit_interview_response(
                 transcript = f"Transcription failed: {str(transcription_error)}"
                 word_count = 0
                 confidence = 0.0
-
-            # Placeholder for audio modification (for noise reduction, etc.)
-            modified_audio_url = audio_extract_url
         
         # Create interview response document matching the database structure
         response_data = {
@@ -709,10 +726,12 @@ async def submit_interview_response(
 
     finally:
         # Clean up temporary files
-        if temp_video_file_path and os.path.exists(temp_video_file_path):
-            os.unlink(temp_video_file_path)
-        if temp_audio_file_path and os.path.exists(temp_audio_file_path):
-            os.unlink(temp_audio_file_path)
+        for temp_file in [temp_video_file_path, temp_audio_file_path, temp_modified_audio_path]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except Exception as e:
+                    logging.warning(f"Failed to delete temporary file {temp_file}: {str(e)}")
             
 @router.post("/complete-interview")
 async def complete_interview(
@@ -897,3 +916,74 @@ def transcribe_audio_with_google_cloud(audio_file_path):
             'confidence': 0.0,
             'raw_results': None
         }
+
+def apply_voice_effect(input_audio_path, effect_type="helium", output_audio_path=None):
+    """
+    Apply voice changing effect to audio file using FFmpeg
+    
+    Args:
+        input_audio_path (str): Path to input audio file
+        effect_type (str): Type of effect to apply ('helium' for pitch shift)
+        output_audio_path (str, optional): Path for output modified audio file
+    
+    Returns:
+        str: Path to modified audio file
+    """
+    ffmpeg_path = r'C:\Users\ruizh\OneDrive\Documents\ffmpeg-n6.1-latest-win64-gpl-6.1\bin\ffmpeg.exe'  # Path to ffmpeg executable
+    
+    if not input_audio_path or not os.path.exists(ffmpeg_path):
+        raise ValueError(f"Invalid input audio path: {input_audio_path}")
+    
+    # If no output path specified, generate one
+    if output_audio_path is None:
+        temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix="_modified.wav")
+        output_audio_path = temp_audio_file.name
+        temp_audio_file.close()
+    
+    try:
+        if effect_type.lower() == "helium":
+            # Helium effect: increase pitch by 3 semitones without changing tempo
+            command = [
+                ffmpeg_path, 
+                '-i', input_audio_path,
+                '-af', 'rubberband=pitch=1.2,loudnorm=I=-16:LRA=11:TP=-1.5,highpass=f=200,lowpass=f=8000',
+                '-ar', '16000',  # Consistent sample rate
+                '-ac', '1',      # Mono channel for clarity
+                '-y',
+                output_audio_path
+            ]
+        else:
+            command = [
+                ffmpeg_path, 
+                '-i', input_audio_path,
+                '-c', 'copy',
+                '-y',
+                output_audio_path
+            ]
+        
+        # Run FFmpeg command
+        result = subprocess.run(
+            command, 
+            stdout=subprocess.PIPE,  
+            stderr=subprocess.PIPE,
+            check=True
+        )
+        
+        # Check for errors in subprocess
+        if result.returncode != 0:
+            logging.error(f"FFmpeg error: {result.stderr.decode()}")
+            raise RuntimeError(f"Voice effect application failed: {result.stderr.decode()}")
+        
+        # Verify output file was created
+        if not os.path.exists(output_audio_path):
+            raise RuntimeError("Voice effect application failed: No output file created")
+        
+        logging.info(f"Voice effect applied successfully: {output_audio_path}")
+        return output_audio_path
+    
+    except subprocess.CalledProcessError as e:
+        logging.error(f"FFmpeg voice effect error: {e.stderr.decode() if e.stderr else str(e)}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in voice effect application: {str(e)}")
+        raise
