@@ -4,6 +4,18 @@ from datetime import datetime, timedelta
 from firebase_admin import firestore
 import uuid
 import logging
+import subprocess
+import os
+import io
+import tempfile
+import base64
+import speech_recognition as sr
+from moviepy import VideoFileClip
+import nltk
+from google.cloud import speech_v1p1beta1 as speech
+from nltk.tokenize import word_tokenize
+from concurrent.futures import ThreadPoolExecutor
+
 from models.interview import (
     InterviewQuestion, GenerateInterviewLinkRequest, InterviewLinkResponse, 
     IdentityVerificationRequest, IdentityVerificationResponse, 
@@ -419,6 +431,83 @@ async def verify_identity(
         logger.error(f"Error verifying identity: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to verify identity: {str(e)}")
 
+def extract_audio_with_ffmpeg(input_video_path, output_audio_path=None):
+    """
+    Extract audio from video using FFmpeg with robust error handling
+    
+    Args:
+        input_video_path (str): Path to input video file
+        output_audio_path (str, optional): Path for output audio file
+    
+    Returns:
+        str: Path to extracted audio file
+    """
+
+    ffmpeg_path = r'C:\Users\ruizh\OneDrive\Documents\ffmpeg-n6.1-latest-win64-gpl-6.1\bin\ffmpeg.exe'  # Path to ffmpeg executable
+    
+    if not input_video_path or not os.path.exists(ffmpeg_path):
+        raise ValueError(f"Invalid input video path: {input_video_path}")
+    
+    # If no output path specified, generate one
+    if output_audio_path is None:
+        temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix="_audio.wav")
+        output_audio_path = temp_audio_file.name
+        temp_audio_file.close()
+    
+    try:
+        # FFmpeg command to extract high-quality audio
+        command = [
+            ffmpeg_path, 
+            '-i', input_video_path,   # Input video file
+            '-vn',                    # Ignore video stream
+            '-acodec', 'pcm_s16le',   
+            '-ar', '8000',            # Lower sample rate might help
+            '-ac', '1',               # Mono channel
+            '-y',                     # Force WAV format
+            output_audio_path         # Output audio file
+        ]
+        
+        # Run FFmpeg command
+        result = subprocess.run(
+            command, 
+            stdout=subprocess.DEVNULL,  
+            stderr=subprocess.DEVNULL,  
+            check=True
+        )
+        
+        # Check for errors in subprocess
+        if result.returncode != 0:
+            logging.error(f"FFmpeg error: {result.stderr}")
+            raise RuntimeError(f"Audio extraction failed: {result.stderr}")
+        
+        # Verify output file was created
+        if not os.path.exists(output_audio_path):
+            raise RuntimeError("Audio extraction failed: No output file created")
+        
+        logging.info(f"Audio extracted successfully: {output_audio_path}")
+        return output_audio_path
+    
+    except subprocess.CalledProcessError as e:
+        logging.error(f"FFmpeg audio extraction error: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in audio extraction: {str(e)}")
+        raise
+
+def parallel_audio_extraction(video_paths):
+    """
+    Extract audio from multiple videos in parallel
+    
+    Args:
+        video_paths (list): List of video file paths
+    
+    Returns:
+        list: Paths to extracted audio files
+    """
+    with ThreadPoolExecutor() as executor:
+        # Use max_workers to control CPU usage
+        return list(executor.map(extract_audio_with_ffmpeg, video_paths))
+    
 # In interviews.py, update the endpoint:
 @router.get("/questions/{interview_id}/{link_code}")
 async def get_interview_questions(
@@ -480,7 +569,12 @@ async def submit_interview_response(
     db: firestore.Client = Depends(get_db),
     storage_bucket = Depends(get_storage)
 ):
+    nltk.download('punkt_tab')
+
     """Submit a video response for an interview question"""
+    temp_video_file_path = None
+    temp_audio_file_path = None
+
     try:
         # Validate interview link
         interview_data = validate_interview_link(request.interviewId, request.linkCode)
@@ -490,6 +584,14 @@ async def submit_interview_response(
         
         # Generate response ID
         response_id = str(uuid.uuid4())
+
+        # Default return values
+        video_url = None
+        audio_extract_url = None
+        modified_audio_url = None
+        transcript = None
+        word_count = 0
+        confidence = 0.0
         
         # If video data is provided directly in the request
         if request.videoResponse:
@@ -499,8 +601,13 @@ async def submit_interview_response(
             else:
                 video_data = request.videoResponse
             
-            import base64
+            # Decode base64 video data
             video_bytes = base64.b64decode(video_data)
+
+            # Create a temporary file to process video (Extract/ Transcript)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_video_file:
+                temp_video_file.write(video_bytes)
+                temp_video_file_path = temp_video_file.name
             
             # Upload video to Firebase Storage
             video_storage_path = f"interview_responses/{application_id}/{request.interviewId}/{request.questionId}.webm"
@@ -510,26 +617,56 @@ async def submit_interview_response(
             
             # Get public URL
             video_url = video_blob.public_url
-            
+
             # Process the video to extract audio and create transcript
-            # This would be implemented in a real system, perhaps using a background job
-            # For now, we'll just create placeholders
-            audio_extract_url = None
-            modified_audio_url = None
-            transcript = None
-            
-            # In a production system, you would:
-            # 1. Extract audio from video
-            # 2. Process audio for clearer speech
-            # 3. Generate transcript using Speech-to-Text
-            
-            # For demo purposes, we'll skip these steps
-        else:
-            # If frontend uploads directly to Firebase, the URL would be provided later
-            video_url = None
-            audio_extract_url = None
-            modified_audio_url = None
-            transcript = None
+            try:
+                # Extract audio using FFmpeg
+                audio_file_path = extract_audio_with_ffmpeg(temp_video_file_path)
+                
+                # Create temporary audio file path
+                temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix="_audio.wav")
+                temp_audio_file_path = temp_video_file.name
+                temp_video_file.close()
+
+                # Use FFmpeg for audio extraction
+                audio_file_path = extract_audio_with_ffmpeg(temp_video_file_path, temp_audio_file_path)
+
+                # Upload extracted audio to Firebase Storage
+                audio_storage_path = f"interview_responses/{application_id}/{request.interviewId}/{response_id}_audio.wav"
+                audio_blob = storage_bucket.blob(audio_storage_path)
+                audio_blob.upload_from_filename(temp_audio_file_path, content_type="audio/wav")
+                audio_blob.make_public()
+                audio_extract_url = audio_blob.public_url
+
+                # Transcribe audio using Google Cloud Speech-to-Text
+                transcription_result = transcribe_audio_with_google_cloud(temp_audio_file_path)
+        
+                transcript = transcription_result['transcript']
+                confidence = transcription_result['confidence']
+                word_count = len(word_tokenize(transcript))
+
+                # Upload transcript to Firestore
+                transcript_data = {
+                    'responseId': response_id,
+                    'applicationId': application_id,
+                    'questionId': request.questionId,
+                    'transcript': transcript,
+                    'confidence': confidence,
+                    'wordCount': word_count,
+                    'createdAt': datetime.utcnow()
+                }
+                
+                # Save transcript to Firestore
+                db.collection('transcripts').document(response_id).set(transcript_data)
+
+            except Exception as transcription_error:
+                logging.error(f"Transcription error: {str(transcription_error)}")
+                transcript = f"Transcription failed: {str(transcription_error)}"
+                word_count = 0
+                confidence = 0.0
+
+            # Placeholder for audio modification (for noise reduction, etc.)
+            modified_audio_url = audio_extract_url
         
         # Create interview response document matching the database structure
         response_data = {
@@ -540,10 +677,11 @@ async def submit_interview_response(
             'audioExtractUrl': audio_extract_url,
             'modifiedAudioUrl': modified_audio_url,
             'transcript': transcript,
+            'wordCount': word_count,
             'submitTime': datetime.utcnow(),
             'analysis': {
                 'clarity': None,
-                'confidence': None,
+                'confidence': confidence,
                 'relevance': None,
                 'totalScore': None,
                 'feedback': None
@@ -557,7 +695,9 @@ async def submit_interview_response(
         return InterviewResponseResponse(
             success=True,
             responseId=response_id,
-            message="Response recorded successfully"
+            message="Response recorded successfully",
+            transcript=transcript,
+            word_count=word_count,
         )
     
     except HTTPException:
@@ -567,6 +707,13 @@ async def submit_interview_response(
         logger.error("Error submitting interview response: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to submit interview response: {str(e)}")
 
+    finally:
+        # Clean up temporary files
+        if temp_video_file_path and os.path.exists(temp_video_file_path):
+            os.unlink(temp_video_file_path)
+        if temp_audio_file_path and os.path.exists(temp_audio_file_path):
+            os.unlink(temp_audio_file_path)
+            
 @router.post("/complete-interview")
 async def complete_interview(
     interview_id: str = Body(...),
@@ -684,3 +831,69 @@ async def get_all_interviews(
     except Exception as e:
         logger.error("Error getting interviews: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get interviews: {str(e)}")
+    
+def transcribe_audio_with_google_cloud(audio_file_path):
+    """
+    Transcribe audio file using Google Cloud Speech-to-Text API
+    
+    Args:
+        audio_file_path (str): Path to the audio file to transcribe
+    
+    Returns:
+        dict: Transcription results with transcript and confidence
+    """
+    try:
+        # Instantiate a client
+        client = speech.SpeechClient()
+        
+        # Read the audio file
+        with io.open(audio_file_path, 'rb') as audio_file:
+            content = audio_file.read()
+        
+        # Configure audio input
+        audio = speech.RecognitionAudio(content=content)
+        
+        # Configure recognition settings
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # WAV format
+            sample_rate_hertz=16000,  # Match FFmpeg output
+            language_code='en-US',
+            enable_automatic_punctuation=True,
+            model='default',  # You can use 'video' model for better video audio
+            profanity_filter=False,
+            speech_contexts=[
+                speech.SpeechContext(
+                    phrases=['interview', 'job', 'experience', 'skills', 'role'],
+                    boost=20.0  # Increase likelihood of these context words
+                )
+            ]
+        )
+        
+        # Perform the transcription request
+        response = client.recognize(config=config, audio=audio)
+        
+        # Process results
+        transcripts = []
+        confidence_scores = []
+        
+        for result in response.results:
+            alternative = result.alternatives[0]
+            transcripts.append(alternative.transcript)
+            confidence_scores.append(alternative.confidence)
+        
+        # Combine multiple transcripts if multiple results
+        full_transcript = ' '.join(transcripts)
+        
+        return {
+            'transcript': full_transcript,
+            'confidence': sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0,
+            'raw_results': response.results
+        }
+    
+    except Exception as e:
+        logging.error(f"Google Cloud Speech-to-Text error: {str(e)}")
+        return {
+            'transcript': f"Transcription error: {str(e)}",
+            'confidence': 0.0,
+            'raw_results': None
+        }
