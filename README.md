@@ -23,8 +23,6 @@ EqualLens is a comprehensive recruitment platform that leverages Google's AI tec
 - [Key Workflows](#key-workflows)
 - [Screenshots](#screenshots)
 - [Future Roadmap](#future-roadmap)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## 🔍 Introduction
 EqualLens is an AI-powered hiring platform designed to eliminate bias and discrimination in recruitment processes. Leveraging Google Cloud AI services and enforcing anonymity, our platform facilitates fair and objective evaluation of candidates based solely on merit. The system addresses employment discrimination issues prevalent in many workplaces, particularly in countries like Malaysia where racial, religious, gender, and age biases can significantly impact hiring decisions.
