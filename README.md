@@ -15,7 +15,7 @@ EqualLens is a comprehensive recruitment platform that leverages Google's AI tec
 
 ## 📋 Table of Contents
 
-- [Introduction](#introduction)
+- [Introduction](##introduction)
 - [Key Features](#key-features)
 - [Google Technologies Used](#google-technologies-used)
 - [System Architecture](#system-architecture)
